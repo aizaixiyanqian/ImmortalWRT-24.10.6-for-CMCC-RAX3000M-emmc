@@ -1,0 +1,8 @@
+# 编译产物与临时文件
+openwrt/
+bin/
+dl/
+*.itb
+*.bin
+!.github/**
+*.zip

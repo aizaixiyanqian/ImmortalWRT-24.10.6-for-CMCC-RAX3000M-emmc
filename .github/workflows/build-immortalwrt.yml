@@ -1,0 +1,186 @@
+name: Build ImmortalWrt for CMCC RAX3000M (eMMC, no docker)
+
+# 触发方式：
+#   1) 网页 Actions -> Build ImmortalWrt for CMCC RAX3000M (eMMC, no docker) -> Run workflow
+#   2) push 到 main 分支（仅当改动了本仓库的配置/脚本/工作流时）
+#   3) 每周一凌晨自动编译一次（cron 为 UTC 时间）
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "ImmortalWrt 源码分支（24.10 为稳定版，OpenAppFilter 官方只支持 24.10.x）"
+        required: true
+        default: openwrt-24.10
+        type: choice
+        options:
+          - openwrt-24.10
+          - master
+          - openwrt-25.12
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/**"
+      - "configs/**"
+      - "diy-part*.sh"
+      - "files/**"
+  schedule:
+    - cron: "0 20 * * 0"
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Shanghai
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: ${{ github.event.inputs.branch || 'openwrt-24.10' }}
+  # 关键：GitHub 托管 runner 的根分区只有约 20GB 可用，/mnt 才是大容量临时盘（约 70GB）。
+  # OpenWrt 全量编译（含 Go 包）很容易超过 20GB，必须放到 /mnt 上，否则跑到后面会因磁盘满
+  # 导致 runner 直接掉线（表现为 job 失败、后面的步骤全部 pending、没有日志）。
+  BUILD_DIR: /mnt/immortalwrt-build
+
+jobs:
+  build:
+    name: Build firmware
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare build disk and swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/share/swift /opt/microsoft /usr/local/.ghcup
+          sudo docker system prune -af --volumes || true
+
+          sudo mkdir -p "$BUILD_DIR"
+          sudo chown -R "$(id -u):$(id -g)" "$BUILD_DIR"
+          echo "===== disk before ====="
+          df -h / /mnt "$BUILD_DIR"
+
+          sudo fallocate -l 4G /mnt/swapfile 2>/dev/null || \
+            sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=4096 status=none || true
+          sudo chmod 600 /mnt/swapfile 2>/dev/null || true
+          sudo mkswap /mnt/swapfile >/dev/null 2>&1 || true
+          sudo swapon /mnt/swapfile 2>/dev/null || echo "swap not enabled (continue without swap)"
+          echo "===== memory ====="
+          free -h
+
+      - name: Clone ImmortalWrt source
+        run: |
+          git clone --depth 1 -b "$REPO_BRANCH" "$REPO_URL" "$BUILD_DIR/openwrt"
+          echo "Source commit: $(git -C "$BUILD_DIR/openwrt" log -1 --pretty='%h %s')"
+          df -h "$BUILD_DIR"
+
+      - name: Cache download directory
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BUILD_DIR }}/openwrt/dl
+          key: dl-${{ env.REPO_BRANCH }}-${{ hashFiles('configs/rax3000m-emmc.config', 'diy-part1.sh', 'diy-part2.sh') }}
+          restore-keys: |
+            dl-${{ env.REPO_BRANCH }}-
+
+      - name: Add feeds and plugin sources
+        working-directory: ${{ env.BUILD_DIR }}/openwrt
+        run: |
+          # 防止 Windows 下上传的文件带 CRLF，导致 bash 脚本执行失败
+          sed -i 's/\r$//' "$GITHUB_WORKSPACE"/diy-part*.sh
+          bash "$GITHUB_WORKSPACE/diy-part1.sh"
+
+      - name: Update and install feeds
+        working-directory: ${{ env.BUILD_DIR }}/openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Load config and build .config
+        working-directory: ${{ env.BUILD_DIR }}/openwrt
+        run: |
+          cp "$GITHUB_WORKSPACE/configs/rax3000m-emmc.config" .config
+          sed -i 's/\r$//' .config
+          rm -rf files
+          cp -rf "$GITHUB_WORKSPACE/files" .
+          find files -type f -exec sed -i 's/\r$//' {} +
+          chmod +x files/etc/uci-defaults/* 2>/dev/null || true
+          bash "$GITHUB_WORKSPACE/diy-part2.sh"
+          echo "===== target ====="
+          grep -E 'DEVICE_cmcc_rax3000m|^CONFIG_TARGET_ROOTFS_PARTSIZE' .config || true
+
+      - name: Verify requested plugins
+        working-directory: ${{ env.BUILD_DIR }}/openwrt
+        run: |
+          missing=0
+          for p in luci-app-passwall2 luci-app-oaf luci-app-adguardhome \
+                   luci-app-accesscontrol-plus luci-app-samba4 \
+                   luci-app-ttyd luci-app-smartdns luci-proto-wireguard; do
+            if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
+              echo "OK   $p"
+            else
+              echo "MISS $p"
+              missing=$((missing + 1))
+            fi
+          done
+          if [ "$missing" -ge 3 ]; then
+            echo "::error::超过 3 个插件没有被选中，请检查 feeds/包名（查看上面 MISS 列表）"
+            exit 1
+          fi
+
+      - name: Download package sources
+        working-directory: ${{ env.BUILD_DIR }}/openwrt
+        run: |
+          make download -j8 || make download -j1 V=s || true
+          find dl -size -1024c -exec rm -f {} \; || true
+          df -h "$BUILD_DIR"
+
+      - name: Build firmware
+        working-directory: ${{ env.BUILD_DIR }}/openwrt
+        run: |
+          set -o pipefail
+          echo "===== disk before build ====="
+          df -h "$BUILD_DIR"
+          echo "===== build start: $(date) ====="
+          if ! make -j"$(nproc)" 2>&1 | tee "$BUILD_DIR/build.log"; then
+            echo "::error::make failed, tail of build log:"
+            tail -n 150 "$BUILD_DIR/build.log" || true
+            exit 1
+          fi
+          echo "===== build end: $(date) ====="
+          df -h "$BUILD_DIR"
+
+      - name: Collect artifacts
+        if: always()
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          TARGET="$BUILD_DIR/openwrt/bin/targets/mediatek/filogic"
+          for f in "$TARGET"/*.itb "$TARGET"/*.bin "$TARGET"/*.fip \
+                   "$TARGET"/*.manifest "$TARGET"/sha256sums "$TARGET"/config.buildinfo; do
+            [ -e "$f" ] && cp -v "$f" "$GITHUB_WORKSPACE/out/" || true
+          done
+          [ -f "$BUILD_DIR/build.log" ] && cp -v "$BUILD_DIR/build.log" "$GITHUB_WORKSPACE/build.log" || true
+          [ -f "$BUILD_DIR/openwrt/.config" ] && cp -v "$BUILD_DIR/openwrt/.config" "$GITHUB_WORKSPACE/build.config" || true
+          echo "===== images ====="
+          ls -lh "$GITHUB_WORKSPACE/out" || true
+          df -h / "$BUILD_DIR" || true
+
+      - name: Upload firmware
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ImmortalWrt-${{ env.REPO_BRANCH }}-RAX3000M-eMMC
+          path: out/*
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload build log and config
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-info-${{ github.run_number }}
+          path: |
+            build.log
+            build.config
+          if-no-files-found: ignore
+          retention-days: 14

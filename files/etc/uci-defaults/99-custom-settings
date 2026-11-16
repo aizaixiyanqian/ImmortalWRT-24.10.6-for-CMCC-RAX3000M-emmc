@@ -1,0 +1,47 @@
+#!/bin/sh
+# /etc/uci-defaults/99-custom-settings
+# 首次启动时执行一次：设置 LAN 地址、主机名、时区、Wi-Fi 名称。
+# 执行时机：/etc/init.d/boot 里已经跑过 `/sbin/wifi config`，
+# 因此此时 wireless 配置里的 radio0/radio1 与默认 Wi-Fi 接口已经生成。
+#
+# 注意：这个公开版本不写入 Wi-Fi 密码，Wi-Fi 默认是开放网络（无加密）。
+# 刷机后请立即在 LuCI（网络 -> 无线）里给 2.4G/5G 设置 WPA2 密码。
+
+# ---------- 1. LAN 口地址 192.168.6.1 ----------
+uci set network.lan.ipaddr='192.168.6.1'
+uci set network.lan.netmask='255.255.255.0'
+uci commit network
+
+# ---------- 2. 主机名 / 时区 ----------
+uci set system.@system[0].hostname='RAX3000M'
+uci set system.@system[0].timezone='CST-8'
+uci set system.@system[0].zonename='Asia/Shanghai'
+uci commit system
+
+# ---------- 3. Wi-Fi（开放网络，无密码） ----------
+# band 的取值由系统自动探测（2g / 5g），所以不写死 phy 路径，换内核也不会失效
+set_wifi() {
+	local band="$1"
+	local ssid="$2"
+	local dev iface
+
+	for dev in $(uci show wireless | sed -n "s/^wireless\.\([^.=]*\)=wifi-device$/\1/p"); do
+		[ "$(uci -q get wireless."$dev".band)" = "$band" ] || continue
+		uci set wireless."$dev".disabled='0'
+		uci set wireless."$dev".country='CN'
+
+		for iface in $(uci show wireless | sed -n "s/^wireless\.\([^.=]*\)=wifi-iface$/\1/p"); do
+			[ "$(uci -q get wireless."$iface".device)" = "$dev" ] || continue
+			uci set wireless."$iface".ssid="$ssid"
+			uci set wireless."$iface".encryption='none'
+			uci -q delete wireless."$iface".key
+			uci set wireless."$iface".disabled='0'
+		done
+	done
+}
+
+set_wifi 2g 'Persist'
+set_wifi 5g 'Persist-5G'
+uci commit wireless
+
+exit 0

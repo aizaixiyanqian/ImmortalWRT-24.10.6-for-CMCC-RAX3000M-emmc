@@ -1,0 +1,5 @@
+# 统一使用 LF 换行：脚本、配置都按 Linux 方式保存，避免 Windows 的 CRLF 让
+# diy-part1.sh / diy-part2.sh 在 GitHub Actions 里执行失败。
+* text=auto eol=lf
+*.sh text eol=lf
+*.config text eol=lf
