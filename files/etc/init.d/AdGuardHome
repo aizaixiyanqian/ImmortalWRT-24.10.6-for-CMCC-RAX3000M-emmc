@@ -1,0 +1,32 @@
+#!/bin/sh /etc/rc.common
+# Compatibility shim for luci-app-adguardhome.
+#
+# The real AdGuard Home instance is managed by /etc/init.d/agh-boot so that
+# there is only ever ONE process (two instances used to waste ~25 MB and fight
+# for ports 3053/3000).  The LuCI page keeps working: start/stop/restart are
+# forwarded to agh-boot.
+
+USE_PROCD=0
+START=95
+STOP=01
+
+start()   { /etc/init.d/agh-boot start; }
+stop()    { /etc/init.d/agh-boot stop; }
+restart() { /etc/init.d/agh-boot restart; }
+reload()  { /etc/init.d/agh-boot restart; }
+boot()    { /etc/init.d/agh-boot start; }
+shutdown(){ /etc/init.d/agh-boot stop; }
+
+status() {
+	local pid
+	pid=$(pgrep -f '/usr/bin/AdGuardHome' 2>/dev/null | head -1)
+	if [ -n "$pid" ]; then
+		echo "running (pid $pid)"
+		return 0
+	fi
+	echo "not running"
+	return 1
+}
+
+isrunning() { status; }
+force_reload() { /etc/init.d/agh-boot restart; }

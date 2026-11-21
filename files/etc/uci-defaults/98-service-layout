@@ -1,0 +1,99 @@
+#!/bin/sh
+# 98-service-layout - first boot after flashing.
+#
+# Service topology (all four are independent, none is a single point of failure):
+#
+#   clients -> dnsmasq:53 -> AdGuardHome:3053 -> SmartDNS:6053 -> xray:2002
+#                         \-> SmartDNS:6053                    \-> 8.8.8.8 (proxy)
+#                         \-> 192.168.1.1:53 (ISP / main router)
+#
+# * dnsmasq is the only resolver clients see. Its upstream list is static and
+#   ordered (AGH -> SmartDNS -> ISP); a dead local resolver answers ICMP port
+#   unreachable, so dnsmasq fails over in about a millisecond. netguard.sh only
+#   restarts crashed services - it never restarts dnsmasq (no port-53 gap).
+# * AdGuardHome falls back to 192.168.1.1 / 223.5.5.5 if SmartDNS is gone.
+# * SmartDNS falls back to the domestic group for cn domains and lets AGH use
+#   its own fallback for everything else.
+# * PassWall2 no longer rewrites dnsmasq (that injected server=2002 +
+#   all-servers and made DNS race against the ISP, causing polluted answers).
+
+# ---------- 1. dnsmasq: ordered, fixed upstreams ----------
+uci -q delete dhcp.@dnsmasq[0].server
+uci -q add_list dhcp.@dnsmasq[0].server='127.0.0.1#3053'
+uci -q add_list dhcp.@dnsmasq[0].server='127.0.0.1#6053'
+uci -q add_list dhcp.@dnsmasq[0].server='192.168.1.1#53'
+uci -q set dhcp.@dnsmasq[0].noresolv='1'
+uci -q set dhcp.@dnsmasq[0].cachesize='1000'
+# never let PassWall2 hijack client DNS; dnsmasq stays the only resolver
+uci -q set dhcp.@dnsmasq[0].dns_redirect='0'
+uci -q commit dhcp
+
+# ---------- 2. PassWall2 must keep its hands off dnsmasq ----------
+uci -q set passwall2.@global[0].dnsmasq_dns_redirect='0'
+# Critical: PassWall2's "direct DNS" must be an EXTERNAL resolver.  If it is
+# left to auto-detect the local resolver (AGH on 3053) the chain becomes
+#   xray-DNS(2002) -> chinadns(2003) -> AGH(3053) -> SmartDNS(6053) -> 2002 ...
+# an endless loop that made xray grow to hundreds of MB within minutes.
+uci -q set passwall2.@global[0].direct_dns='192.168.1.1'
+uci -q set passwall2.@global[0].direct_dns_protocol='udp'
+# start the proxy shortly after boot instead of the default 60 s delay
+uci -q set passwall2.@global_delay[0].start_delay='10'
+uci -q commit passwall2
+
+# ---------- 3. SmartDNS: domestic group + xray group ----------
+uci -q set smartdns.@smartdns[0].enabled='1'
+uci -q set smartdns.@smartdns[0].cache_size='2048'
+uci -q set smartdns.@smartdns[0].resolve_local_hostnames='1'
+# SmartDNS must not rewrite dnsmasq by itself either
+uci -q set smartdns.@smartdns[0].auto_set_dnsmasq='0'
+# IMPORTANT: talk to PassWall2's DNS resolver (127.0.0.1:2002) over UDP.
+# With TCP (server-tcp) every query opened a new connection inside PassWall's
+# DNS tunnel and xray burned up to a full CPU core (load average ~2 on 2 cores).
+for _s in $(uci show smartdns | sed -n "s/^smartdns\.\([^.]*\)\.port='2002'$/\1/p"); do
+	uci -q set smartdns.$_s.type='udp'
+done
+# keep-config upgrades may not have the entry at all: create it as UDP
+if ! uci -q show smartdns | grep -q "\.port='2002'"; then
+	_s=$(uci add smartdns server)
+	uci -q set smartdns.$_s.type='udp'
+	uci -q set smartdns.$_s.ip='127.0.0.1'
+	uci -q set smartdns.$_s.port='2002'
+	uci -q set smartdns.$_s.enabled='1'
+fi
+uci -q commit smartdns
+
+# PassWall2's Go core: 64 MB GOMEMLIMIT is tight enough to trigger GC thrash
+# under DNS load.  192 MB is still a soft cap (nothing is allocated up front)
+# and keeps xray calm while memory stays around 45 MB.
+sed -i 's/^export GOMEMLIMIT=.*/export GOMEMLIMIT=201326592/' /etc/init.d/passwall2 2>/dev/null
+
+# cn domain list is optional; only wire the rule when the file is present
+if [ -s /etc/smartdns/chnlist.txt ]; then
+	cat > /etc/smartdns/custom.conf <<-'EOF'
+	# cn domains -> domestic DNS group (fast CDN answers)
+	domain-set -name cnlist -type list -file /etc/smartdns/chnlist.txt
+	domain-rules /domain-set:cnlist/ -nameserver cn
+	domain-rules /cn/ -nameserver cn
+	EOF
+else
+	cat > /etc/smartdns/custom.conf <<-'EOF'
+	# no chnlist.txt: SmartDNS uses its default (xray) group only
+	EOF
+fi
+
+# ---------- 4. services that only cost RAM on this box ----------
+for s in avahi-daemon dbus snmpd wsdd2 samba4 bridger radius \
+	sing-box xray passwall2_server adguardhome; do
+	/etc/init.d/$s stop >/dev/null 2>&1
+	/etc/init.d/$s disable >/dev/null 2>&1
+done
+
+# ---------- 5. exactly one AdGuardHome, supervised by netguard ----------
+/etc/init.d/AdGuardHome disable >/dev/null 2>&1
+/etc/init.d/agh-boot enable
+/etc/init.d/netguard enable
+
+# ---------- 6. the old 2-minute cron watchdog is replaced by netguard ----------
+sed -i '/service-watchdog/d' /etc/crontabs/root 2>/dev/null
+
+exit 0

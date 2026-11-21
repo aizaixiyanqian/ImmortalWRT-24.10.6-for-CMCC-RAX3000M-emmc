@@ -1,7 +1,7 @@
-name: Build ImmortalWrt for CMCC RAX3000M (eMMC, no docker)
+name: Build ImmortalWrt for CMCC RAX3000M (eMMC)
 
 # 触发方式：
-#   1) 网页 Actions -> Build ImmortalWrt for CMCC RAX3000M (eMMC, no docker) -> Run workflow
+#   1) 网页 Actions -> Build ImmortalWrt for CMCC RAX3000M (eMMC) -> Run workflow
 #   2) push 到 main 分支（仅当改动了本仓库的配置/脚本/工作流时）
 #   3) 每周一凌晨自动编译一次（cron 为 UTC 时间）
 on:
@@ -79,9 +79,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.BUILD_DIR }}/openwrt/dl
-          key: dl-${{ env.REPO_BRANCH }}-${{ hashFiles('configs/rax3000m-emmc.config', 'diy-part1.sh', 'diy-part2.sh') }}
+          # v2: the previous cache could contain a truncated adguardhome tarball,
+          # which made "Build firmware" fail 4 s into the adguardhome compile.
+          key: dl-${{ env.REPO_BRANCH }}-v2-${{ hashFiles('configs/rax3000m-emmc.config', 'diy-part1.sh', 'diy-part2.sh') }}
           restore-keys: |
-            dl-${{ env.REPO_BRANCH }}-
+            dl-${{ env.REPO_BRANCH }}-v2-
 
       - name: Add feeds and plugin sources
         working-directory: ${{ env.BUILD_DIR }}/openwrt
@@ -104,18 +106,24 @@ jobs:
           rm -rf files
           cp -rf "$GITHUB_WORKSPACE/files" .
           find files -type f -exec sed -i 's/\r$//' {} +
-          chmod +x files/etc/uci-defaults/* 2>/dev/null || true
+          chmod +x files/etc/uci-defaults/* files/etc/init.d/* 2>/dev/null || true
+          chmod +x files/usr/bin/* 2>/dev/null || true
           bash "$GITHUB_WORKSPACE/diy-part2.sh"
           echo "===== target ====="
           grep -E 'DEVICE_cmcc_rax3000m|^CONFIG_TARGET_ROOTFS_PARTSIZE' .config || true
 
+      # PassWall2 26.11.11 emits Xray "tunnel" inbounds.  The xray-core package
+      # in the 24.10 feed is 25.2.21 and refuses that config with
+      #   "unknown config id: tunnel"
+      # so bake the official 26.11.9 arm64 binary over /usr/bin/xray.
+      # This runs after the files/ copy + CRLF sed, so the binary is not mangled.
+      # NOTE: never execute the binary here - the runner is x86_64 and an arm64
+      # ELF fails with "cannot execute binary file: Exec format error"; check
+      # the file type/size/hash instead.
       - name: Bake Xray 26.11.9 into image
         working-directory: ${{ env.BUILD_DIR }}/openwrt
         run: |
           set -e
-          # 当前 24.10 源码源里的 xray-core 是 25.2.21，PassWall2 26.x 的新配置格式
-          # 在旧内核上会报 "unknown config id: tunnel"。这里把官方 26.11.9 的
-          # arm64 二进制放进 files/，镜像打包时最后覆盖 /usr/bin/xray。
           XRAY_VER="26.11.9"
           URL="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VER}/Xray-linux-arm64-v8a.zip"
           curl -fL --retry 3 --retry-delay 2 -o /tmp/xray.zip "$URL"
@@ -124,8 +132,13 @@ jobs:
           unzip -o /tmp/xray.zip -d /tmp/xray-bin
           install -D -m 0755 /tmp/xray-bin/xray files/usr/bin/xray
           file files/usr/bin/xray
-          echo "baked /usr/bin/xray size: $(stat -c %s files/usr/bin/xray) bytes"
-          ls -l files/usr/bin/xray
+          case "$(file -b files/usr/bin/xray)" in
+            *aarch64*|*ARM*aarch64*) echo "OK arm64 xray baked" ;;
+            *) echo "::error::baked xray is not aarch64: $(file -b files/usr/bin/xray)"; exit 1 ;;
+          esac
+          size=$(stat -c %s files/usr/bin/xray)
+          [ "$size" -gt 20000000 ] || { echo "::error::xray too small: $size"; exit 1; }
+          ls -lh files/usr/bin/xray
 
       - name: Verify requested plugins
         working-directory: ${{ env.BUILD_DIR }}/openwrt
@@ -149,8 +162,15 @@ jobs:
       - name: Download package sources
         working-directory: ${{ env.BUILD_DIR }}/openwrt
         run: |
-          make download -j8 || make download -j1 V=s || true
-          find dl -size -1024c -exec rm -f {} \; || true
+          # Force a clean fetch of AdGuardHome's source+frontend. A truncated file
+          # from the dl cache used to make the later compile fail after 1.5 h.
+          rm -f dl/adguardhome-*.tar.gz dl/adguardhome-frontend-*.tar.gz
+          make download -j8 || make download -j1 V=s
+          find dl -type f -size -1024c -delete
+          for f in dl/adguardhome-*.tar.gz dl/adguardhome-frontend-*.tar.gz; do
+            [ -s "$f" ] || { echo "::error::missing download: $f"; exit 1; }
+            echo "OK $(stat -c%s "$f") bytes  $f"
+          done
           df -h "$BUILD_DIR"
 
       - name: Build firmware
@@ -163,6 +183,12 @@ jobs:
           if ! make -j"$(nproc)" 2>&1 | tee "$BUILD_DIR/build.log"; then
             echo "::error::make failed, tail of build log:"
             tail -n 150 "$BUILD_DIR/build.log" || true
+            # keep the per-package logs so the next failure is diagnosable
+            [ -d logs ] && tar czf "$BUILD_DIR/build-logs.tgz" logs || true
+            if [ -f logs/package/feeds/packages/adguardhome/compile.txt ]; then
+              echo "===== adguardhome compile log ====="
+              tail -n 120 logs/package/feeds/packages/adguardhome/compile.txt || true
+            fi
             exit 1
           fi
           echo "===== build end: $(date) ====="
@@ -178,6 +204,7 @@ jobs:
             [ -e "$f" ] && cp -v "$f" "$GITHUB_WORKSPACE/out/" || true
           done
           [ -f "$BUILD_DIR/build.log" ] && cp -v "$BUILD_DIR/build.log" "$GITHUB_WORKSPACE/build.log" || true
+          [ -f "$BUILD_DIR/build-logs.tgz" ] && cp -v "$BUILD_DIR/build-logs.tgz" "$GITHUB_WORKSPACE/build-logs.tgz" || true
           [ -f "$BUILD_DIR/openwrt/.config" ] && cp -v "$BUILD_DIR/openwrt/.config" "$GITHUB_WORKSPACE/build.config" || true
           echo "===== images ====="
           ls -lh "$GITHUB_WORKSPACE/out" || true
@@ -200,5 +227,6 @@ jobs:
           path: |
             build.log
             build.config
+            build-logs.tgz
           if-no-files-found: ignore
           retention-days: 14

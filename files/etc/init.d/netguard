@@ -1,0 +1,16 @@
+#!/bin/sh /etc/rc.common
+# Procd wrapper for the netguard watchdog (see /usr/bin/netguard.sh).
+# It keeps the LAN online when PassWall2 / AdGuardHome / SmartDNS / OAF die.
+
+START=99
+STOP=05
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance
+	procd_set_param command /bin/sh /usr/bin/netguard.sh
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 0
+	procd_set_param stderr 0
+	procd_close_instance
+}

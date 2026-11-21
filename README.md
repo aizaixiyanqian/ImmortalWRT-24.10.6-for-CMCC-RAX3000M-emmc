@@ -176,3 +176,13 @@ A：说明编译在生成镜像之前就失败了，本次运行是红的，看 
 
 **Q：刷完还是 192.168.1.1？**
 A：升级时勾了「保留配置」。重新刷一次并取消保留配置（`sysupgrade -n`）。
+
+## 2026-11-21 更新：DNS/服务架构固化
+
+- 新增 `files/usr/bin/agh-supervisor.sh`、`agh-upstream.sh`、`dnsprobe.lua`、`netguard.sh`
+- 新增 `/etc/init.d/agh-boot`、`/etc/init.d/netguard`；`AdGuardHome` 改为兼容壳，避免起两个实例
+- dnsmasq 固定有序上游：`127.0.0.1#3053` → `127.0.0.1#6053` → `192.168.1.1#53`
+- SmartDNS 的 2002 上游改为 **UDP**（TCP 会把 xray 单核跑满），内置 10.9 万条国内域名分流
+- 预置 `/etc/AdGuardHome.yaml`：监听 3053、上游 SmartDNS 6053；**不含管理员密码**，首次打开 AGH 面板请立即设置
+- 本公开版本仍**不写入 Wi-Fi 密码**，首次开机 Wi-Fi 为开放网络，请刷机后第一时间在 LuCI 设置 WPA2
+- 构建时注入 Xray 26.11.9（feed 的 25.2.21 不认 PassWall2 26.x 的 `tunnel` 入站）

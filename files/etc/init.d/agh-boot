@@ -1,0 +1,24 @@
+#!/bin/sh /etc/rc.common
+# procd-managed AdGuard Home launcher.
+#
+# Runs /usr/bin/agh-supervisor.sh which keeps AdGuardHome as a child and, the
+# moment it dies, redirects its DNS port to SmartDNS (nft) so dnsmasq never
+# waits for a timeout.  A Go heap soft limit keeps AGH from growing into the
+# whole router.
+
+START=97
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	# keep the DNS section pointed at SmartDNS with independent fallbacks
+	[ -x /usr/bin/agh-upstream.sh ] && /usr/bin/agh-upstream.sh
+
+	procd_open_instance
+	procd_set_param command /bin/sh /usr/bin/agh-supervisor.sh
+	procd_set_param respawn 3600 5 5
+	procd_set_param env GOGC=50 GOMEMLIMIT=100663296
+	procd_set_param stdout 0
+	procd_set_param stderr 0
+	procd_close_instance
+}
